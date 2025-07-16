@@ -1,0 +1,299 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create release for'
+        required: true
+        type: string
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        variant: [cpu, gpu]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.tag || github.ref }}
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install uv
+      run: |
+        pip install uv
+        uv --version
+    
+    - name: Install dependencies
+      run: |
+        uv sync
+        uv add --dev pyinstaller>=6.0.0
+    
+    - name: Install GPU dependencies
+      if: matrix.variant == 'gpu'
+      run: |
+        uv add nvidia-cudnn-cu12
+    
+    - name: Get version from tag
+      id: version
+      run: |
+        if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+          $version = "${{ github.event.inputs.tag }}"
+        } else {
+          $version = "${{ github.ref }}" -replace 'refs/tags/', ''
+        }
+        "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        Write-Host "Version: $version"
+      shell: pwsh
+    
+    - name: Build executables
+      run: |
+        .\build-ci.ps1 -BuildType both -GPU:$${{ matrix.variant == 'gpu' }} -Version "${{ steps.version.outputs.version }}"
+      shell: pwsh
+    
+    - name: Create release package
+      id: package
+      run: |
+        $version = "${{ steps.version.outputs.version }}"
+        $variant = "${{ matrix.variant }}"
+        $packageName = "scribe-windows-$version-$variant"
+        $packageDir = "dist/$packageName"
+        
+        Write-Host "Creating release package: $packageName"
+        New-Item -ItemType Directory -Path $packageDir -Force
+        
+        # Copy executables
+        Copy-Item -Recurse "dist/scribe-cli" "$packageDir/"
+        Copy-Item -Recurse "dist/scribe-gui-windows" "$packageDir/"
+        
+        # Create launchers
+        @"
+        @echo off
+        echo Starting Scribe CLI...
+        cd /d "%~dp0scribe-cli"
+        scribe-cli.exe %*
+        pause
+        "@ | Out-File -FilePath "$packageDir/run-scribe-cli.bat" -Encoding ASCII
+        
+        @"
+        @echo off
+        echo Starting Scribe Windows GUI...
+        cd /d "%~dp0scribe-gui-windows"
+        start scribe-gui-windows.exe
+        "@ | Out-File -FilePath "$packageDir/run-scribe-gui.bat" -Encoding ASCII
+        
+        # Create detailed README
+        $readmeContent = @"
+        Scribe - Speech-to-Text for Windows
+        ==================================
+        
+        Version: $version
+        Variant: $variant ($(if ($variant -eq 'gpu') { 'GPU-accelerated' } else { 'CPU-only' }))
+        Build Date: $(Get-Date -Format "yyyy-MM-dd HH:mm UTC")
+        Built from: ${{ github.ref }}
+        
+        ## Quick Start
+        
+        1. Extract this zip file to any folder
+        2. Double-click run-scribe-gui.bat for the graphical interface
+        3. Or double-click run-scribe-cli.bat for command-line usage
+        
+        ## Contents
+        
+        - scribe-cli/: Command-line version
+          - Launcher: run-scribe-cli.bat
+          - Executable: scribe-cli/scribe-cli.exe
+          - Usage: run-scribe-cli.bat --help
+        
+        - scribe-gui-windows/: Windows GUI version
+          - Launcher: run-scribe-gui.bat
+          - Executable: scribe-gui-windows/scribe-gui-windows.exe
+        
+        ## Features
+        
+        - Real-time speech-to-text transcription
+        - Voice Activity Detection (VAD) for automatic chunking
+        - Multiple Whisper model sizes (tiny, base, small, medium, large, turbo)
+        - Native Windows audio support (no FFmpeg required)
+        - GPU acceleration: $(if ($variant -eq 'gpu') { 'YES - Requires NVIDIA GPU with CUDA' } else { 'NO - CPU-only for maximum compatibility' })
+        
+        ## System Requirements
+        
+        - Windows 10 (version 1903) or Windows 11
+        - 4GB RAM minimum, 8GB recommended
+        - 2GB free disk space
+        - Microphone access
+        $(if ($variant -eq 'gpu') { "- NVIDIA GPU with CUDA support and 4GB+ VRAM" } else { "" })
+        
+        ## Usage Examples
+        
+        ### GUI Mode
+        1. Double-click run-scribe-gui.bat
+        2. Select your preferred Whisper model
+        3. Click "Start Recording"
+        4. Speak into your microphone
+        5. View transcription in real-time
+        
+        ### Command Line Mode
+        ```
+        # Basic usage with default settings
+        run-scribe-cli.bat
+        
+        # Use different model
+        cd scribe-cli
+        scribe-cli.exe --model large
+        
+        # Specify language
+        scribe-cli.exe --language en
+        
+        # Debug mode
+        scribe-cli.exe --debug --verbose
+        ```
+        
+        ## Troubleshooting
+        
+        ### Audio Issues
+        - Ensure microphone permissions are granted
+        - Check Windows audio settings
+        - Try different microphone devices
+        
+        ### Performance Issues
+        - For faster processing, use smaller models (tiny, base)
+        - Close unnecessary applications
+        $(if ($variant -eq 'gpu') { "- Ensure NVIDIA drivers are up to date" } else { "- Consider upgrading to GPU variant for faster processing" })
+        
+        ### Error Messages
+        - Run with --debug flag for detailed logging
+        - Check Windows Event Viewer for system-level errors
+        
+        ## Support
+        
+        - GitHub: https://github.com/jhjaggars/scribe
+        - Issues: https://github.com/jhjaggars/scribe/issues
+        - Documentation: See README.md in the GitHub repository
+        
+        ## License
+        
+        See LICENSE file in the GitHub repository.
+        "@
+        
+        $readmeContent | Out-File -FilePath "$packageDir/README.txt" -Encoding UTF8
+        
+        # Create changelog/release notes
+        $changelogContent = @"
+        Scribe $version Release Notes
+        ============================
+        
+        This is an automated release build.
+        
+        ## What's New
+        
+        $(if ($variant -eq 'gpu') { "This is the GPU-accelerated variant with NVIDIA CUDA support." } else { "This is the CPU-only variant for maximum compatibility." })
+        
+        ## Build Information
+        
+        - Build Date: $(Get-Date -Format "yyyy-MM-dd HH:mm UTC")
+        - Build Environment: GitHub Actions on Windows
+        - Python Version: 3.11
+        - PyInstaller Version: 6.0+
+        
+        ## Included Components
+        
+        - Scribe CLI: Command-line speech-to-text tool
+        - Scribe GUI: Windows graphical interface
+        - Native Windows audio support (sounddevice)
+        - All required dependencies bundled
+        
+        For full changelog, see: https://github.com/jhjaggars/scribe/releases
+        "@
+        
+        $changelogContent | Out-File -FilePath "$packageDir/CHANGELOG.txt" -Encoding UTF8
+        
+        # Create zip package
+        $zipPath = "dist/$packageName.zip"
+        Compress-Archive -Path $packageDir -DestinationPath $zipPath -Force
+        
+        $zipSize = (Get-Item $zipPath).Length / 1MB
+        Write-Host "Package created: $zipPath ($([math]::Round($zipSize, 1)) MB)"
+        
+        # Output for subsequent steps
+        "package-name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "zip-path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "zip-size=$([math]::Round($zipSize, 1))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      shell: pwsh
+    
+    - name: Test release package
+      run: |
+        $packageName = "${{ steps.package.outputs.package-name }}"
+        $packageDir = "dist/$packageName"
+        
+        Write-Host "Testing release package..."
+        
+        # Test CLI
+        & "$packageDir/scribe-cli/scribe-cli.exe" --help
+        if ($LASTEXITCODE -eq 0) {
+          Write-Host "✓ CLI executable works"
+        } else {
+          Write-Host "✗ CLI executable failed"
+          exit 1
+        }
+        
+        # Test that GUI executable exists and is valid PE file
+        $guiExe = "$packageDir/scribe-gui-windows/scribe-gui-windows.exe"
+        if (Test-Path $guiExe) {
+          Write-Host "✓ GUI executable exists"
+        } else {
+          Write-Host "✗ GUI executable missing"
+          exit 1
+        }
+        
+        # Test launchers exist
+        if ((Test-Path "$packageDir/run-scribe-cli.bat") -and (Test-Path "$packageDir/run-scribe-gui.bat")) {
+          Write-Host "✓ Launcher scripts exist"
+        } else {
+          Write-Host "✗ Launcher scripts missing"
+          exit 1
+        }
+        
+        Write-Host "✓ Release package validation passed"
+      shell: pwsh
+    
+    - name: Upload to release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.version }}
+        files: ${{ steps.package.outputs.zip-path }}
+        name: "Scribe ${{ steps.version.outputs.version }}"
+        body: |
+          ## Windows Release - ${{ matrix.variant }} variant
+          
+          **Download**: ${{ steps.package.outputs.package-name }}.zip (${{ steps.package.outputs.zip-size }} MB)
+          
+          ### Quick Start
+          1. Download and extract the zip file
+          2. Run `run-scribe-gui.bat` for graphical interface
+          3. Or run `run-scribe-cli.bat` for command-line usage
+          
+          ### This Variant
+          - **${{ matrix.variant }}**: ${{ matrix.variant == 'gpu' && 'GPU-accelerated (requires NVIDIA GPU with CUDA)' || 'CPU-only (maximum compatibility)' }}
+          
+          ### What's Included
+          - Scribe CLI and GUI executables
+          - All dependencies bundled (no Python installation required)
+          - Native Windows audio support
+          - Easy-to-use launcher scripts
+          
+          See README.txt in the package for detailed usage instructions.
+        draft: false
+        prerelease: ${{ contains(steps.version.outputs.version, 'dev') || contains(steps.version.outputs.version, 'rc') }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

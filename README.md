@@ -1,6 +1,10 @@
 # Scribe
 
-A speech-to-text transcription tool with both CLI and GUI interfaces, using OpenAI Whisper and FFmpeg for real-time transcription.
+[![Build Windows](https://github.com/jhjaggars/scribe/actions/workflows/build-windows.yml/badge.svg)](https://github.com/jhjaggars/scribe/actions/workflows/build-windows.yml)
+[![Tests](https://github.com/jhjaggars/scribe/actions/workflows/test.yml/badge.svg)](https://github.com/jhjaggars/scribe/actions/workflows/test.yml)
+[![Release](https://github.com/jhjaggars/scribe/actions/workflows/release.yml/badge.svg)](https://github.com/jhjaggars/scribe/actions/workflows/release.yml)
+
+A speech-to-text transcription tool with both CLI and GUI interfaces, using OpenAI Whisper for real-time transcription.
 
 ## Features
 

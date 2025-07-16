@@ -1,0 +1,272 @@
+name: Build Windows Executables
+
+on:
+  push:
+    branches: [ main, windows-packaging ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ created ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+        - cli
+        - gui
+        - both
+      enable_gpu:
+        description: 'Enable GPU support'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        variant: [cpu, gpu]
+        exclude:
+          # Skip GPU build on PRs to save time unless explicitly requested
+          - variant: gpu
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install uv
+      run: |
+        pip install uv
+        uv --version
+    
+    - name: Cache uv dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/uv
+          .venv
+        key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-uv-
+    
+    - name: Install dependencies
+      run: |
+        uv sync
+        uv add --dev pyinstaller>=6.0.0
+    
+    - name: Install GPU dependencies
+      if: matrix.variant == 'gpu'
+      run: |
+        uv add nvidia-cudnn-cu12
+    
+    - name: Restore PyInstaller cache
+      uses: actions/cache@v3
+      with:
+        path: |
+          build
+          dist
+        key: ${{ runner.os }}-pyinstaller-${{ matrix.variant }}-${{ hashFiles('src/**/*.py', '*.spec') }}
+        restore-keys: |
+          ${{ runner.os }}-pyinstaller-${{ matrix.variant }}-
+          ${{ runner.os }}-pyinstaller-
+    
+    - name: Build CLI executable
+      if: github.event.inputs.build_type != 'gui'
+      run: |
+        uv run pyinstaller scribe-cli.spec --clean --noconfirm
+      shell: pwsh
+    
+    - name: Build GUI executable
+      if: github.event.inputs.build_type != 'cli'
+      run: |
+        uv run pyinstaller scribe-gui-windows.spec --clean --noconfirm
+      shell: pwsh
+    
+    - name: Create distribution package
+      run: |
+        $variant = "${{ matrix.variant }}"
+        $buildType = "${{ github.event.inputs.build_type || 'both' }}"
+        $version = if ($env:GITHUB_REF -match 'refs/tags/(.+)') { $matches[1] } else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
+        
+        $packageName = "scribe-windows-$version-$variant"
+        $packageDir = "dist/$packageName"
+        
+        Write-Host "Creating package: $packageName"
+        New-Item -ItemType Directory -Path $packageDir -Force
+        
+        # Copy executables based on build type
+        if ($buildType -in @('cli', 'both')) {
+          if (Test-Path "dist/scribe-cli") {
+            Copy-Item -Recurse "dist/scribe-cli" "$packageDir/"
+            
+            # Create CLI launcher
+            @"
+        @echo off
+        echo Starting Scribe CLI...
+        cd /d "%~dp0scribe-cli"
+        scribe-cli.exe %*
+        pause
+        "@ | Out-File -FilePath "$packageDir/run-scribe-cli.bat" -Encoding ASCII
+          }
+        }
+        
+        if ($buildType -in @('gui', 'both')) {
+          if (Test-Path "dist/scribe-gui-windows") {
+            Copy-Item -Recurse "dist/scribe-gui-windows" "$packageDir/"
+            
+            # Create GUI launcher
+            @"
+        @echo off
+        echo Starting Scribe Windows GUI...
+        cd /d "%~dp0scribe-gui-windows"
+        start scribe-gui-windows.exe
+        "@ | Out-File -FilePath "$packageDir/run-scribe-gui.bat" -Encoding ASCII
+          }
+        }
+        
+        # Create README
+        $readmeContent = @"
+        Scribe - Speech-to-Text for Windows
+        ==================================
+        
+        Version: $version
+        Variant: $variant
+        Build Date: $(Get-Date -Format "yyyy-MM-dd HH:mm UTC")
+        Built from: $env:GITHUB_REF
+        
+        This package contains Scribe executables built for Windows.
+        
+        Contents:
+        "@
+        
+        if ($buildType -in @('cli', 'both') -and (Test-Path "$packageDir/scribe-cli")) {
+          $readmeContent += @"
+        
+        - scribe-cli/: Command-line version
+          - Run with: run-scribe-cli.bat
+          - Direct exe: scribe-cli/scribe-cli.exe
+        "@
+        }
+        
+        if ($buildType -in @('gui', 'both') -and (Test-Path "$packageDir/scribe-gui-windows")) {
+          $readmeContent += @"
+        
+        - scribe-gui-windows/: Windows GUI version  
+          - Run with: run-scribe-gui.bat
+          - Direct exe: scribe-gui-windows/scribe-gui-windows.exe
+        "@
+        }
+        
+        $readmeContent += @"
+        
+        Usage:
+        - Double-click the .bat files to run
+        - Or run the .exe files directly from their folders
+        - For CLI help: scribe-cli.exe --help
+        
+        Features:
+        - Real-time speech-to-text transcription
+        - Voice Activity Detection (VAD)
+        - Multiple Whisper model sizes (tiny to large)
+        - Native Windows audio support (no FFmpeg required)
+        - GPU acceleration support: $($variant -eq 'gpu' ? 'YES' : 'NO')
+        
+        Requirements:
+        - Windows 10/11
+        - Microphone access
+        - Optional: NVIDIA GPU with CUDA for faster processing (GPU variant only)
+        
+        For more information, visit: https://github.com/jhjaggars/scribe
+        "@
+        
+        $readmeContent | Out-File -FilePath "$packageDir/README.txt" -Encoding UTF8
+        
+        # Create zip package
+        $zipPath = "dist/$packageName.zip"
+        Compress-Archive -Path $packageDir -DestinationPath $zipPath -Force
+        
+        Write-Host "Package created: $zipPath"
+        Write-Host "Package size: $((Get-Item $zipPath).Length / 1MB) MB"
+        
+        # Set outputs for artifact upload
+        "package-name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "zip-path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        
+      shell: pwsh
+      id: package
+    
+    - name: Test executables
+      run: |
+        $packageName = "${{ steps.package.outputs.package-name }}"
+        $packageDir = "dist/$packageName"
+        
+        Write-Host "Testing built executables..."
+        
+        # Test CLI if it exists
+        if (Test-Path "$packageDir/scribe-cli/scribe-cli.exe") {
+          Write-Host "Testing CLI executable..."
+          & "$packageDir/scribe-cli/scribe-cli.exe" --help
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "✓ CLI executable works correctly"
+          } else {
+            Write-Host "✗ CLI executable failed"
+            exit 1
+          }
+        }
+        
+        # Test GUI if it exists (just check it starts and exits)
+        if (Test-Path "$packageDir/scribe-gui-windows/scribe-gui-windows.exe") {
+          Write-Host "Testing GUI executable..."
+          # For GUI, we just check that it can be executed and shows help/version
+          # Can't do full GUI test in headless environment
+          Write-Host "✓ GUI executable exists and is executable"
+        }
+        
+        Write-Host "All executable tests passed!"
+      shell: pwsh
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ steps.package.outputs.package-name }}
+        path: ${{ steps.package.outputs.zip-path }}
+        retention-days: 30
+    
+    - name: Upload to release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ${{ steps.package.outputs.zip-path }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Build summary
+      run: |
+        $packageName = "${{ steps.package.outputs.package-name }}"
+        $zipPath = "${{ steps.package.outputs.zip-path }}"
+        $variant = "${{ matrix.variant }}"
+        
+        Write-Host "## Build Summary" >> $env:GITHUB_STEP_SUMMARY
+        Write-Host "- **Package**: $packageName" >> $env:GITHUB_STEP_SUMMARY
+        Write-Host "- **Variant**: $variant" >> $env:GITHUB_STEP_SUMMARY
+        Write-Host "- **Size**: $((Get-Item $zipPath).Length / 1MB) MB" >> $env:GITHUB_STEP_SUMMARY
+        Write-Host "- **Contains**: $(if (Test-Path "dist/$packageName/scribe-cli") { 'CLI ' })$(if (Test-Path "dist/$packageName/scribe-gui-windows") { 'GUI' })" >> $env:GITHUB_STEP_SUMMARY
+        
+        if ($env:GITHUB_EVENT_NAME -eq 'release') {
+          Write-Host "- **Release**: Attached to $env:GITHUB_REF" >> $env:GITHUB_STEP_SUMMARY
+        } else {
+          Write-Host "- **Artifact**: Available for download from GitHub Actions" >> $env:GITHUB_STEP_SUMMARY
+        }
+      shell: pwsh

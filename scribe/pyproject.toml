@@ -1,0 +1,20 @@
+[project]
+name = "scribe"
+version = "0.1.0"
+description = "A CLI tool for real-time speech-to-text transcription using OpenAI Whisper"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "faster-whisper",
+    "numpy>=2.0.0",
+    "click",
+    "torch==2.7.0",
+    "torchaudio==2.7.0",
+]
+
+[project.scripts]
+scribe = "scribe.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

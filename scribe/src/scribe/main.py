@@ -7,6 +7,10 @@ import subprocess
 import sys
 import platform
 import time
+import threading
+import queue
+import wave
+import numpy as np
 from pathlib import Path
 
 import click
@@ -133,6 +137,447 @@ class FFmpegRecorder:
                 pass
 
 
+class StreamingRecorder:
+    """Handles continuous microphone recording with chunked processing."""
+    
+    def __init__(self, sample_rate=16000, channels=1, chunk_duration=5.0, 
+                 overlap_duration=1.0, silence_threshold=0.01, debug=False,
+                 vad_mode=False, vad_silence_duration=0.5, vad_max_duration=30.0):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.chunk_duration = chunk_duration
+        self.overlap_duration = overlap_duration
+        self.silence_threshold = silence_threshold
+        self.platform = platform.system().lower()
+        self.debug = debug
+        
+        # VAD mode settings
+        self.vad_mode = vad_mode
+        self.vad_silence_duration = vad_silence_duration
+        self.vad_max_duration = vad_max_duration
+        
+        self.process = None
+        self.audio_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.recording_thread = None
+        
+        # Calculate samples for chunks and overlap
+        self.chunk_samples = int(sample_rate * chunk_duration)
+        self.overlap_samples = int(sample_rate * overlap_duration)
+        self.buffer = np.array([], dtype=np.int16)
+        
+        # VAD state tracking
+        self.vad_silence_samples = int(sample_rate * vad_silence_duration)
+        self.vad_max_samples = int(sample_rate * vad_max_duration)
+        self.vad_frame_size = int(sample_rate * 0.1)  # 100ms frames for VAD analysis
+        self.vad_consecutive_silence_frames = 0
+        self.vad_current_chunk_samples = 0
+        self.vad_in_speech = False
+        self.vad_speech_buffer = np.array([], dtype=np.int16)
+        
+        # Debug counters
+        self.debug_stats = {
+            'total_chunks_processed': 0,
+            'chunks_with_audio': 0,
+            'chunks_skipped_silence': 0,
+            'bytes_read': 0,
+            'ffmpeg_errors': 0,
+            'processing_errors': 0,
+            'vad_chunks_by_silence': 0,
+            'vad_chunks_by_max_duration': 0
+        }
+        
+        if self.debug:
+            self._debug_log(f"StreamingRecorder initialized:")
+            self._debug_log(f"  Sample rate: {sample_rate}Hz")
+            if self.vad_mode:
+                self._debug_log(f"  VAD mode: ENABLED")
+                self._debug_log(f"  VAD silence duration: {vad_silence_duration}s ({self.vad_silence_samples} samples)")
+                self._debug_log(f"  VAD max duration: {vad_max_duration}s ({self.vad_max_samples} samples)")
+                self._debug_log(f"  VAD frame size: {self.vad_frame_size} samples")
+            else:
+                self._debug_log(f"  VAD mode: DISABLED")
+                self._debug_log(f"  Chunk duration: {chunk_duration}s ({self.chunk_samples} samples)")
+                self._debug_log(f"  Overlap duration: {overlap_duration}s ({self.overlap_samples} samples)")
+            self._debug_log(f"  Silence threshold: {silence_threshold}")
+            self._debug_log(f"  Platform: {self.platform}")
+    
+    def _debug_log(self, message):
+        """Log debug message to stderr."""
+        if self.debug:
+            click.echo(f"[DEBUG] {message}", err=True)
+        
+    def get_audio_input_args(self):
+        """Get platform-specific FFmpeg audio input arguments for streaming."""
+        if self.platform == "linux":
+            try:
+                subprocess.run(["arecord", "-l"], capture_output=True, check=True)
+                return ["-f", "alsa", "-i", "default"]
+            except:
+                return ["-f", "pulse", "-i", "default"]
+        elif self.platform == "darwin":  # macOS
+            return ["-f", "avfoundation", "-i", ":0"]
+        elif self.platform == "windows":
+            return ["-f", "dshow", "-i", "audio="]
+        else:
+            return ["-f", "pulse", "-i", "default"]
+    
+    def _recording_worker(self):
+        """Worker thread for continuous audio recording."""
+        cmd = ["ffmpeg", "-y"]
+        cmd.extend(self.get_audio_input_args())
+        cmd.extend([
+            "-acodec", "pcm_s16le",
+            "-ar", str(self.sample_rate),
+            "-ac", str(self.channels),
+            "-f", "wav",
+            "pipe:1"  # Output to stdout
+        ])
+        
+        self._debug_log(f"Starting FFmpeg with command: {' '.join(cmd)}")
+        
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                bufsize=0
+            )
+            
+            self._debug_log(f"FFmpeg process started with PID: {self.process.pid}")
+            
+            # Skip WAV header (44 bytes)
+            header = self.process.stdout.read(44)
+            if len(header) < 44:
+                self._debug_log(f"Failed to read WAV header, got {len(header)} bytes")
+                return
+            
+            self._debug_log(f"WAV header read successfully ({len(header)} bytes)")
+            
+            # Read audio data in small chunks
+            read_size = self.sample_rate * 2 // 10  # 0.1 second chunks
+            self._debug_log(f"Reading audio in chunks of {read_size} bytes")
+            
+            bytes_read_total = 0
+            read_count = 0
+            
+            while not self.stop_event.is_set() and self.process.poll() is None:
+                try:
+                    data = self.process.stdout.read(read_size)
+                    if not data:
+                        self._debug_log("No data received from FFmpeg, breaking")
+                        break
+                    
+                    bytes_read_total += len(data)
+                    read_count += 1
+                    self.debug_stats['bytes_read'] += len(data)
+                    
+                    # Convert to numpy array
+                    audio_data = np.frombuffer(data, dtype=np.int16)
+                    self.audio_queue.put(audio_data)
+                    
+                    if read_count % 50 == 0:  # Log every 5 seconds
+                        self._debug_log(f"Read {read_count} chunks, {bytes_read_total} bytes total")
+                    
+                except Exception as e:
+                    self._debug_log(f"Error reading audio data: {e}")
+                    self.debug_stats['ffmpeg_errors'] += 1
+                    if not self.stop_event.is_set():
+                        self.audio_queue.put(None)  # Signal error
+                    break
+            
+            # Check if FFmpeg process ended with error
+            if self.process.poll() is not None:
+                stderr_output = self.process.stderr.read().decode('utf-8', errors='ignore')
+                if stderr_output:
+                    self._debug_log(f"FFmpeg stderr: {stderr_output}")
+                    
+        except Exception as e:
+            self._debug_log(f"Fatal error in recording worker: {e}")
+            self.debug_stats['ffmpeg_errors'] += 1
+            self.audio_queue.put(None)
+    
+    def start_streaming(self):
+        """Start continuous audio streaming."""
+        self.stop_event.clear()
+        self.recording_thread = threading.Thread(target=self._recording_worker)
+        self.recording_thread.daemon = True
+        self.recording_thread.start()
+        
+    def get_next_chunk(self):
+        """Get the next audio chunk for processing."""
+        start_time = time.time()
+        
+        while not self.stop_event.is_set():
+            try:
+                # Collect audio data until we have enough for a chunk
+                queue_gets = 0
+                while len(self.buffer) < self.chunk_samples and not self.stop_event.is_set():
+                    try:
+                        audio_data = self.audio_queue.get(timeout=0.1)
+                        if audio_data is None:  # Error signal
+                            self._debug_log("Received error signal from recording thread")
+                            return None
+                        self.buffer = np.concatenate([self.buffer, audio_data])
+                        queue_gets += 1
+                    except queue.Empty:
+                        continue
+                
+                if len(self.buffer) >= self.chunk_samples:
+                    # Extract chunk
+                    chunk = self.buffer[:self.chunk_samples]
+                    
+                    # Keep overlap for next chunk
+                    if self.overlap_samples > 0:
+                        self.buffer = self.buffer[self.chunk_samples - self.overlap_samples:]
+                    else:
+                        self.buffer = self.buffer[self.chunk_samples:]
+                    
+                    self.debug_stats['total_chunks_processed'] += 1
+                    chunk_time = time.time() - start_time
+                    
+                    # Check if chunk has enough audio (not just silence)
+                    if self._has_audio(chunk):
+                        self.debug_stats['chunks_with_audio'] += 1
+                        
+                        # Save chunk to temporary file
+                        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+                        self._save_chunk_to_file(chunk, temp_file.name)
+                        temp_file.close()
+                        
+                        self._debug_log(f"Chunk {self.debug_stats['total_chunks_processed']}: "
+                                      f"has audio, saved to {temp_file.name} "
+                                      f"(collected from {queue_gets} queue items in {chunk_time:.2f}s)")
+                        
+                        return temp_file.name
+                    else:
+                        self.debug_stats['chunks_skipped_silence'] += 1
+                        self._debug_log(f"Chunk {self.debug_stats['total_chunks_processed']}: "
+                                      f"skipped (silence), RMS below threshold "
+                                      f"(collected from {queue_gets} queue items in {chunk_time:.2f}s)")
+                        
+                        # Continue to next chunk
+                        start_time = time.time()
+                        continue
+                        
+            except Exception as e:
+                self._debug_log(f"Error in get_next_chunk: {e}")
+                self.debug_stats['processing_errors'] += 1
+                continue
+                
+        self._debug_log("get_next_chunk exiting due to stop event")
+        return None
+    
+    def get_next_vad_chunk(self):
+        """Get the next audio chunk using Voice Activity Detection."""
+        start_time = time.time()
+        
+        while not self.stop_event.is_set():
+            try:
+                # Get audio data from queue
+                try:
+                    audio_data = self.audio_queue.get(timeout=0.1)
+                    if audio_data is None:  # Error signal
+                        self._debug_log("Received error signal from recording thread")
+                        return None
+                    
+                    # Add to main buffer for frame-by-frame analysis
+                    self.buffer = np.concatenate([self.buffer, audio_data])
+                    
+                except queue.Empty:
+                    continue
+                
+                # Process audio in frames for VAD analysis
+                while len(self.buffer) >= self.vad_frame_size:
+                    # Extract frame
+                    frame = self.buffer[:self.vad_frame_size]
+                    self.buffer = self.buffer[self.vad_frame_size:]
+                    
+                    # Analyze frame for speech/silence
+                    frame_has_speech = self._has_audio(frame)
+                    
+                    if frame_has_speech:
+                        # Speech detected
+                        if not self.vad_in_speech:
+                            self._debug_log("VAD: Speech started")
+                            self.vad_in_speech = True
+                        
+                        # Add frame to speech buffer
+                        self.vad_speech_buffer = np.concatenate([self.vad_speech_buffer, frame])
+                        self.vad_current_chunk_samples += len(frame)
+                        self.vad_consecutive_silence_frames = 0
+                        
+                    else:
+                        # Silence detected
+                        if self.vad_in_speech:
+                            # We were in speech, now silence
+                            self.vad_consecutive_silence_frames += 1
+                            silence_duration = self.vad_consecutive_silence_frames * self.vad_frame_size / self.sample_rate
+                            
+                            self._debug_log(f"VAD: Silence frame {self.vad_consecutive_silence_frames}, "
+                                          f"duration: {silence_duration:.2f}s")
+                            
+                            # Add silence frame to buffer (we might still be in a pause)
+                            self.vad_speech_buffer = np.concatenate([self.vad_speech_buffer, frame])
+                            self.vad_current_chunk_samples += len(frame)
+                            
+                            # Check if silence duration exceeded threshold
+                            if silence_duration >= self.vad_silence_duration:
+                                self._debug_log("VAD: Silence threshold exceeded, ending chunk")
+                                chunk = self._finalize_vad_chunk("silence")
+                                if chunk:
+                                    return chunk
+                        else:
+                            # We're in silence, continue
+                            pass
+                    
+                    # Check maximum duration failsafe
+                    if self.vad_current_chunk_samples >= self.vad_max_samples:
+                        self._debug_log("VAD: Maximum duration reached, ending chunk")
+                        chunk = self._finalize_vad_chunk("max_duration")
+                        if chunk:
+                            return chunk
+                    
+            except Exception as e:
+                self._debug_log(f"Error in get_next_vad_chunk: {e}")
+                self.debug_stats['processing_errors'] += 1
+                continue
+        
+        # If we're exiting and have accumulated speech, return it
+        if len(self.vad_speech_buffer) > 0:
+            self._debug_log("VAD: Returning final chunk on exit")
+            chunk = self._finalize_vad_chunk("exit")
+            if chunk:
+                return chunk
+        
+        self._debug_log("get_next_vad_chunk exiting due to stop event")
+        return None
+    
+    def _finalize_vad_chunk(self, reason):
+        """Finalize and return a VAD chunk."""
+        if len(self.vad_speech_buffer) == 0:
+            return None
+        
+        # Determine if chunk has enough audio content
+        if self._has_audio(self.vad_speech_buffer):
+            self.debug_stats['total_chunks_processed'] += 1
+            self.debug_stats['chunks_with_audio'] += 1
+            
+            if reason == "silence":
+                self.debug_stats['vad_chunks_by_silence'] += 1
+            elif reason == "max_duration":
+                self.debug_stats['vad_chunks_by_max_duration'] += 1
+            
+            # Save chunk to temporary file
+            temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            self._save_chunk_to_file(self.vad_speech_buffer, temp_file.name)
+            temp_file.close()
+            
+            chunk_duration = len(self.vad_speech_buffer) / self.sample_rate
+            
+            self._debug_log(f"VAD Chunk {self.debug_stats['total_chunks_processed']}: "
+                          f"duration={chunk_duration:.2f}s, samples={len(self.vad_speech_buffer)}, "
+                          f"reason={reason}, saved to {temp_file.name}")
+            
+            # Reset VAD state
+            self.vad_speech_buffer = np.array([], dtype=np.int16)
+            self.vad_current_chunk_samples = 0
+            self.vad_consecutive_silence_frames = 0
+            self.vad_in_speech = False
+            
+            return temp_file.name
+        else:
+            # Chunk doesn't have enough audio, skip it
+            self.debug_stats['total_chunks_processed'] += 1
+            self.debug_stats['chunks_skipped_silence'] += 1
+            
+            self._debug_log(f"VAD Chunk {self.debug_stats['total_chunks_processed']}: "
+                          f"skipped (insufficient audio), reason={reason}")
+            
+            # Reset VAD state
+            self.vad_speech_buffer = np.array([], dtype=np.int16)
+            self.vad_current_chunk_samples = 0
+            self.vad_consecutive_silence_frames = 0
+            self.vad_in_speech = False
+            
+            return None
+    
+    def _has_audio(self, audio_data):
+        """Check if audio chunk contains significant audio (not just silence)."""
+        # Calculate RMS (root mean square) to detect audio
+        rms = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
+        normalized_rms = rms / 32768.0  # Normalize to 0-1 range
+        
+        # Additional statistics for debugging
+        max_val = np.max(np.abs(audio_data))
+        min_val = np.min(audio_data)
+        mean_val = np.mean(audio_data)
+        
+        has_audio = normalized_rms > self.silence_threshold
+        
+        self._debug_log(f"Audio analysis: RMS={normalized_rms:.6f}, "
+                       f"max={max_val}, min={min_val}, mean={mean_val:.2f}, "
+                       f"threshold={self.silence_threshold}, has_audio={has_audio}")
+        
+        return has_audio
+    
+    def _save_chunk_to_file(self, audio_data, filename):
+        """Save audio chunk to WAV file."""
+        with wave.open(filename, 'wb') as wav_file:
+            wav_file.setnchannels(self.channels)
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(self.sample_rate)
+            wav_file.writeframes(audio_data.tobytes())
+    
+    def stop_streaming(self):
+        """Stop continuous audio streaming."""
+        self.stop_event.set()
+        
+        if self.process:
+            try:
+                self.process.stdin.write(b'q\n')
+                self.process.stdin.flush()
+            except:
+                pass
+            
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+                self.process.wait()
+        
+        if self.recording_thread:
+            self.recording_thread.join(timeout=2)
+    
+    def print_debug_stats(self):
+        """Print debug statistics."""
+        if self.debug:
+            self._debug_log("=== STREAMING STATISTICS ===")
+            self._debug_log(f"Total chunks processed: {self.debug_stats['total_chunks_processed']}")
+            self._debug_log(f"Chunks with audio: {self.debug_stats['chunks_with_audio']}")
+            self._debug_log(f"Chunks skipped (silence): {self.debug_stats['chunks_skipped_silence']}")
+            
+            if self.vad_mode:
+                self._debug_log(f"VAD chunks by silence: {self.debug_stats['vad_chunks_by_silence']}")
+                self._debug_log(f"VAD chunks by max duration: {self.debug_stats['vad_chunks_by_max_duration']}")
+                self._debug_log(f"VAD current state: {'Speech' if self.vad_in_speech else 'Silence'}")
+                self._debug_log(f"VAD speech buffer size: {len(self.vad_speech_buffer)} samples")
+                self._debug_log(f"VAD consecutive silence frames: {self.vad_consecutive_silence_frames}")
+            
+            self._debug_log(f"Total bytes read: {self.debug_stats['bytes_read']}")
+            self._debug_log(f"FFmpeg errors: {self.debug_stats['ffmpeg_errors']}")
+            self._debug_log(f"Processing errors: {self.debug_stats['processing_errors']}")
+            self._debug_log(f"Buffer size: {len(self.buffer)} samples")
+            self._debug_log(f"Queue size: {self.audio_queue.qsize()}")
+            self._debug_log("=============================")
+    
+    def cleanup(self):
+        """Clean up resources."""
+        self.print_debug_stats()
+        self.stop_streaming()
+
+
 @click.command()
 @click.option('--model', default='base', 
               type=click.Choice(['tiny', 'base', 'small', 'medium', 'large', 'turbo']),
@@ -140,11 +585,32 @@ class FFmpegRecorder:
 @click.option('--language', default=None, 
               help='Language code (e.g., "en", "es", "fr"). Auto-detect if not specified.')
 @click.option('--verbose', is_flag=True, help='Enable verbose output')
-def main(model, language, verbose):
+@click.option('--stream', is_flag=True, help='Enable continuous streaming mode')
+@click.option('--chunk-duration', default=5.0, type=float,
+              help='Duration of each audio chunk in seconds (streaming mode)')
+@click.option('--overlap-duration', default=1.0, type=float,
+              help='Overlap between chunks in seconds (streaming mode)')
+@click.option('--silence-threshold', default=0.01, type=float,
+              help='Silence threshold for detecting empty segments (streaming mode)')
+@click.option('--debug', is_flag=True, help='Enable detailed debug output for troubleshooting')
+@click.option('--no-newlines', is_flag=True, help='Output text without newlines (space-separated)')
+@click.option('--vad', is_flag=True, help='Enable Voice Activity Detection mode (break chunks on silence)')
+@click.option('--vad-silence-duration', default=0.5, type=float,
+              help='Duration of silence required to end a chunk in VAD mode (seconds)')
+@click.option('--vad-max-duration', default=30.0, type=float,
+              help='Maximum chunk duration in VAD mode (seconds)')
+def main(model, language, verbose, stream, chunk_duration, overlap_duration, silence_threshold, debug, no_newlines, vad, vad_silence_duration, vad_max_duration):
     """Record audio from microphone and transcribe it using OpenAI Whisper."""
     
+    def output_text(text):
+        """Output text with proper formatting based on no_newlines flag."""
+        if no_newlines:
+            print(text.strip(), end=' ', flush=True)
+        else:
+            print(text.strip(), flush=True)
+    
     if verbose:
-        click.echo(f"Loading Whisper model: {model}")
+        click.echo(f"Loading Whisper model: {model}", err=True)
     
     # Load Whisper model
     try:
@@ -153,46 +619,139 @@ def main(model, language, verbose):
         click.echo(f"Error loading Whisper model: {e}", err=True)
         sys.exit(1)
     
-    # Initialize recorder
-    recorder = FFmpegRecorder()
-    
-    click.echo("Press Ctrl+C to stop recording and transcribe...", err=True)
-    
-    # Start recording
-    try:
-        temp_filename = recorder.start_recording()
+    if stream:
+        # Streaming mode
+        if vad:
+            if verbose or debug:
+                click.echo(f"Starting VAD streaming mode (silence: {vad_silence_duration}s, max: {vad_max_duration}s)", err=True)
+        else:
+            if verbose or debug:
+                click.echo(f"Starting streaming mode (chunk: {chunk_duration}s, overlap: {overlap_duration}s)", err=True)
         
-        # Wait for user to stop recording
+        recorder = StreamingRecorder(
+            chunk_duration=chunk_duration,
+            overlap_duration=overlap_duration,
+            silence_threshold=silence_threshold,
+            debug=debug,
+            vad_mode=vad,
+            vad_silence_duration=vad_silence_duration,
+            vad_max_duration=vad_max_duration
+        )
+        
+        click.echo("Press Ctrl+C to stop streaming...", err=True)
+        
         try:
-            while recorder.process and recorder.process.poll() is None:
-                time.sleep(0.1)  # Small delay to prevent busy waiting
+            recorder.start_streaming()
+            
+            if debug:
+                click.echo("[DEBUG] Started streaming, beginning chunk processing...", err=True)
+            
+            chunk_count = 0
+            transcription_count = 0
+            
+            # Process chunks continuously
+            while True:
+                if vad:
+                    chunk_file = recorder.get_next_vad_chunk()
+                else:
+                    chunk_file = recorder.get_next_chunk()
+                    
+                if chunk_file is None:
+                    if debug:
+                        chunk_method = "get_next_vad_chunk" if vad else "get_next_chunk"
+                        click.echo(f"[DEBUG] {chunk_method} returned None, exiting loop", err=True)
+                    break
+                
+                chunk_count += 1
+                
+                try:
+                    # Transcribe chunk
+                    transcribe_start = time.time()
+                    segments, info = whisper_model.transcribe(chunk_file, language=language)
+                    transcribe_time = time.time() - transcribe_start
+                    
+                    if debug:
+                        click.echo(f"[DEBUG] Transcribed chunk {chunk_count} in {transcribe_time:.2f}s", err=True)
+                    
+                    # Output transcription immediately
+                    segment_count = 0
+                    for segment in segments:
+                        if segment.text.strip():
+                            output_text(segment.text)
+                            segment_count += 1
+                            transcription_count += 1
+                    
+                    if debug:
+                        click.echo(f"[DEBUG] Chunk {chunk_count} produced {segment_count} segments", err=True)
+                    
+                    # Clean up chunk file
+                    os.unlink(chunk_file)
+                    
+                except Exception as e:
+                    if verbose or debug:
+                        click.echo(f"[ERROR] Error processing chunk {chunk_count}: {e}", err=True)
+                    # Clean up chunk file on error
+                    try:
+                        os.unlink(chunk_file)
+                    except:
+                        pass
+                    continue
+                    
         except KeyboardInterrupt:
-            click.echo("\nStopping recording...", err=True)
-        
-        # Stop recording and get the recorded file
-        recorded_file = recorder.stop_recording()
-        
-        if not recorded_file or not os.path.exists(recorded_file):
-            click.echo("No audio data recorded.", err=True)
-            recorder.cleanup()
+            if verbose or debug:
+                click.echo(f"\n[DEBUG] Stopping streaming... (processed {chunk_count} chunks, {transcription_count} transcriptions)", err=True)
+        except Exception as e:
+            click.echo(f"Error during streaming: {e}", err=True)
             sys.exit(1)
+        finally:
+            recorder.cleanup()
+    
+    else:
+        # Original batch mode
+        recorder = FFmpegRecorder()
         
-        if verbose:
-            click.echo("Processing audio with Whisper...", err=True)
+        click.echo("Press Ctrl+C to stop recording and transcribe...", err=True)
         
-        # Transcribe with Whisper
-        segments, info = whisper_model.transcribe(recorded_file, language=language)
-        
-        # Output transcription to stdout
-        text = " ".join(segment.text for segment in segments)
-        print(text.strip())
-        
-    except Exception as e:
-        click.echo(f"Error during recording/transcription: {e}", err=True)
-        sys.exit(1)
-    finally:
-        # Clean up
-        recorder.cleanup()
+        try:
+            temp_filename = recorder.start_recording()
+            
+            # Wait for user to stop recording
+            try:
+                while recorder.process and recorder.process.poll() is None:
+                    time.sleep(0.1)
+            except KeyboardInterrupt:
+                click.echo("\nStopping recording...", err=True)
+            
+            # Stop recording and get the recorded file
+            recorded_file = recorder.stop_recording()
+            
+            if not recorded_file or not os.path.exists(recorded_file):
+                click.echo("No audio data recorded.", err=True)
+                recorder.cleanup()
+                sys.exit(1)
+            
+            if verbose:
+                click.echo("Processing audio with Whisper...", err=True)
+            
+            # Transcribe with Whisper
+            segments, info = whisper_model.transcribe(recorded_file, language=language)
+            
+            # Output transcription to stdout
+            if no_newlines:
+                # For no_newlines mode, output all segments as space-separated text
+                text = " ".join(segment.text for segment in segments)
+                output_text(text)
+            else:
+                # For normal mode, output each segment separately
+                for segment in segments:
+                    if segment.text.strip():
+                        output_text(segment.text)
+            
+        except Exception as e:
+            click.echo(f"Error during recording/transcription: {e}", err=True)
+            sys.exit(1)
+        finally:
+            recorder.cleanup()
 
 
 if __name__ == '__main__':

@@ -285,32 +285,64 @@ class ScribeGUI:
             
         self.log_message("Stopping Scribe...")
         
+        # Update UI immediately to show stopping state
+        self.stop_button.set_sensitive(False)
+        self.status_label.set_text("Status: Stopping...")
+        
+        # Start asynchronous stop process
+        stop_thread = threading.Thread(target=self._stop_processes_async, daemon=True)
+        stop_thread.start()
+        
+    def _stop_processes_async(self):
+        """Asynchronously stop processes without blocking the UI."""
         try:
             # Send SIGINT to scribe process (equivalent to Ctrl+C)
             if self.scribe_process and self.scribe_process.poll() is None:
                 self.scribe_process.send_signal(signal.SIGINT)
+                self.log_message("Sent stop signal to Scribe process...")
                 
             # Terminate output process
             if self.output_process and self.output_process.poll() is None:
                 self.output_process.terminate()
+                self.log_message("Terminating output process...")
                 
-            # Wait for processes to finish
+            # Wait for scribe process to finish with progressive escalation
             if self.scribe_process:
                 try:
-                    self.scribe_process.wait(timeout=5)
+                    self.scribe_process.wait(timeout=3)
+                    self.log_message("Scribe process stopped gracefully")
                 except subprocess.TimeoutExpired:
-                    self.scribe_process.kill()
-                    
+                    self.log_message("Scribe process didn't stop gracefully, sending SIGTERM...")
+                    self.scribe_process.terminate()
+                    try:
+                        self.scribe_process.wait(timeout=2)
+                        self.log_message("Scribe process terminated")
+                    except subprocess.TimeoutExpired:
+                        self.log_message("Force killing Scribe process...")
+                        self.scribe_process.kill()
+                        self.scribe_process.wait()
+                        
+            # Wait for output process to finish
             if self.output_process:
                 try:
-                    self.output_process.wait(timeout=2)
+                    self.output_process.wait(timeout=1)
+                    self.log_message("Output process stopped")
                 except subprocess.TimeoutExpired:
+                    self.log_message("Force killing output process...")
                     self.output_process.kill()
+                    self.output_process.wait()
+                    
+            # Wait for monitor thread to finish
+            if self.monitor_thread and self.monitor_thread.is_alive():
+                self.monitor_thread.join(timeout=1)
+                if self.monitor_thread.is_alive():
+                    self.log_message("Monitor thread still running (will be cleaned up)")
                     
         except Exception as e:
             self.log_message(f"Error stopping processes: {e}")
             
-        self.cleanup_processes()
+        # Clean up and update UI
+        GLib.idle_add(self.cleanup_processes)
         
     def cleanup_processes(self):
         """Clean up process state."""

@@ -10,10 +10,12 @@ dependencies = [
     "click",
     "torch==2.7.0",
     "torchaudio==2.7.0",
+    "PyGObject",
 ]
 
 [project.scripts]
 scribe = "scribe.main:main"
+scribe-gui = "scribe.gui:main"
 
 [build-system]
 requires = ["hatchling"]

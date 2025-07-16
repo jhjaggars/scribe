@@ -44,6 +44,28 @@ brew install gtk+3 pygobject3
 uv sync
 ```
 
+### Desktop Integration (Optional)
+
+For easy GUI access, you can install the desktop file to your system:
+
+```bash
+# Install for current user only (recommended)
+cp scribe.desktop ~/.local/share/applications/
+chmod +x ~/.local/share/applications/scribe.desktop
+
+# Update desktop database to make it appear in application menus
+update-desktop-database ~/.local/share/applications/
+
+# Alternative: Install system-wide (requires sudo)
+sudo cp scribe.desktop /usr/share/applications/
+sudo chmod +x /usr/share/applications/scribe.desktop
+sudo update-desktop-database /usr/share/applications/
+```
+
+**Note**: Before installing the desktop file, you may need to edit the `Path=` line in `scribe.desktop` to match your installation directory if it's not in `/home/jhjaggars/code/scribe`.
+
+After installation, you can launch the GUI from your application menu by searching for "Scribe" or find it in the Audio/Office category.
+
 ## Usage
 
 ### GUI Application

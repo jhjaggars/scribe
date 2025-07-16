@@ -1,33 +1,76 @@
 # Scribe
 
-A simple CLI tool for real-time speech-to-text transcription using OpenAI Whisper and FFmpeg.
+A speech-to-text transcription tool with both CLI and GUI interfaces, using OpenAI Whisper and FFmpeg for real-time transcription.
 
 ## Features
 
 - **Real-time streaming transcription** with Voice Activity Detection (VAD)
+- **GTK GUI interface** for easy management and configuration
 - Speech-to-text transcription using faster-whisper
 - Multiple Whisper model sizes (tiny, base, small, medium, large, turbo)
 - Cross-platform support (Linux, macOS, Windows)
 - Space-separated output by default (optimal for piping to other tools)
 - Language detection or manual language specification
 - Batch recording mode for traditional record-then-transcribe workflow
+- **Configurable silence threshold** for fine-tuned voice detection
+- **Output piping** to external commands (e.g., xvkbd for virtual keyboard input)
 
 ## Requirements
 
 - Python 3.8 or higher (but less than 3.10)
 - FFmpeg installed on your system
 - A working microphone
+- **For GUI**: GTK 3.0 development libraries (see installation notes below)
 
 ## Installation
 
 1. Clone or download this project
-2. Install using uv:
+2. **For GUI users**: Install GTK development libraries:
+
+```bash
+# Ubuntu/Debian
+sudo apt install libgtk-3-dev libcairo2-dev libgirepository1.0-dev
+
+# Fedora/RHEL
+sudo dnf install gtk3-devel cairo-devel gobject-introspection-devel
+
+# macOS
+brew install gtk+3 pygobject3
+```
+
+3. Install using uv:
 
 ```bash
 uv sync
 ```
 
 ## Usage
+
+### GUI Application
+
+For users who prefer a graphical interface:
+
+```bash
+# Launch the GUI
+uv run scribe-gui
+```
+
+**GUI Features:**
+- **Model Selection**: Choose from tiny, base, small, medium, large, or turbo models
+- **Language Configuration**: Optional language specification (e.g., "en", "es", "fr")
+- **Output Command**: Configure where transcribed text gets sent (default: `xvkbd -file -`)
+- **Silence Threshold**: Adjust voice detection sensitivity (default: 0.002, lower = more sensitive)
+- **Mode Selection**: Choose between Streaming (VAD) or Batch mode
+- **Real-time Log**: Monitor Scribe output and process status
+- **Start/Stop Controls**: Easy process management with visual feedback
+
+**Common Output Commands:**
+- `xvkbd -file -` - Send text to virtual keyboard (types transcribed text)
+- `cat > output.txt` - Save transcription to a file
+- `espeak` - Text-to-speech playback
+- Leave empty to display output in the log only
+
+### Command Line Interface
 
 ### Basic usage (streaming mode with VAD)
 ```bash
@@ -71,6 +114,10 @@ uv run scribe --language fr  # French
 # Adjust VAD sensitivity
 uv run scribe --vad-silence-duration 1.0  # Require 1s of silence to end chunk
 uv run scribe --vad-max-duration 60.0     # Force chunk end after 60s
+
+# Adjust silence threshold for voice detection
+uv run scribe --silence-threshold 0.002   # More sensitive (lower values detect quieter sounds)
+uv run scribe --silence-threshold 0.01    # Less sensitive (default)
 
 # Debug mode to see what's happening
 uv run scribe --debug
@@ -146,7 +193,37 @@ brew install ffmpeg
 - Models are cached locally after first download
 - Try starting with the `tiny` model first to test functionality
 
+### GUI not starting
+- Ensure GTK development libraries are installed (see Installation section)
+- Check that PyGObject is properly installed: `python -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk"`
+- On some systems, you may need to install additional packages:
+  ```bash
+  # Ubuntu/Debian
+  sudo apt install python3-gi-cairo
+  
+  # Fedora/RHEL
+  sudo dnf install python3-cairo
+  ```
+
+### Output command not working
+- Ensure the output command is installed and available in PATH
+- For `xvkbd`: Install with `sudo apt install xvkbd` (Ubuntu/Debian)
+- Test output commands manually before using in the GUI
+- Check the log output for specific error messages
+
 ## Examples
+
+### GUI Example
+```bash
+$ uv run scribe-gui
+# Opens GTK window with:
+# - Model: base (selected)
+# - Language: (empty, auto-detect)
+# - Output Command: xvkbd -file -
+# - Silence Threshold: 0.002
+# - Mode: Streaming (VAD) selected
+# Click "Start" to begin transcription, "Stop" to end
+```
 
 ### Streaming Mode Example
 ```bash

@@ -11,11 +11,13 @@ dependencies = [
     "torch==2.7.0",
     "torchaudio==2.7.0",
     "PyGObject",
+    "sounddevice",
 ]
 
 [project.scripts]
 scribe = "scribe.main:main"
 scribe-gui = "scribe.gui:main"
+scribe-gui-windows = "scribe.gui_windows:main"
 
 [build-system]
 requires = ["hatchling"]

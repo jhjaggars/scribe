@@ -39,6 +39,15 @@ if "SCRIBE_CUDNN_SETUP" not in os.environ:
 
 from faster_whisper import WhisperModel
 
+# Import Windows-specific audio support
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except (ImportError, OSError):
+    # OSError occurs when PortAudio is not available
+    SOUNDDEVICE_AVAILABLE = False
+    sd = None
+
 
 class FFmpegRecorder:
     """Handles microphone recording using FFmpeg subprocess."""
@@ -135,6 +144,262 @@ class FFmpegRecorder:
                 os.unlink(self.temp_file.name)
             except:
                 pass
+
+
+class WindowsAudioRecorder:
+    """Handles continuous microphone recording using sounddevice for Windows."""
+    
+    def __init__(self, sample_rate=16000, channels=1, chunk_duration=5.0, 
+                 overlap_duration=1.0, silence_threshold=0.01, debug=False,
+                 vad_mode=False, vad_silence_duration=0.5, vad_max_duration=30.0):
+        if not SOUNDDEVICE_AVAILABLE:
+            raise RuntimeError("sounddevice library not available. Install with: pip install sounddevice")
+        
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.chunk_duration = chunk_duration
+        self.overlap_duration = overlap_duration
+        self.silence_threshold = silence_threshold
+        self.debug = debug
+        
+        # VAD mode settings
+        self.vad_mode = vad_mode
+        self.vad_silence_duration = vad_silence_duration
+        self.vad_max_duration = vad_max_duration
+        
+        self.audio_queue = queue.Queue()  # For raw audio data
+        self.chunk_queue = queue.Queue()  # For ready chunk filenames
+        self.stop_event = threading.Event()
+        self.recording_thread = None
+        self.stream = None
+        
+        # Calculate samples for chunks and overlap
+        self.chunk_samples = int(sample_rate * chunk_duration)
+        self.overlap_samples = int(sample_rate * overlap_duration)
+        self.buffer = np.array([], dtype=np.float32)
+        
+        # VAD state tracking
+        self.vad_silence_samples = int(sample_rate * vad_silence_duration)
+        self.vad_max_samples = int(sample_rate * vad_max_duration)
+        self.vad_frame_size = int(sample_rate * 0.1)  # 100ms frames for VAD analysis
+        self.vad_consecutive_silence_frames = 0
+        self.vad_current_chunk_samples = 0
+        self.vad_in_speech = False
+        self.vad_speech_buffer = np.array([], dtype=np.float32)
+        
+        # Debug counters
+        self.debug_stats = {
+            'total_chunks_processed': 0,
+            'chunks_with_audio': 0,
+            'chunks_skipped_silence': 0,
+            'processing_errors': 0,
+            'vad_chunks_by_silence': 0,
+            'vad_chunks_by_max_duration': 0
+        }
+        
+        if self.debug:
+            self._debug_log(f"WindowsAudioRecorder initialized:")
+            self._debug_log(f"  Sample rate: {sample_rate}Hz")
+            self._debug_log(f"  Channels: {channels}")
+            if self.vad_mode:
+                self._debug_log(f"  VAD mode: ENABLED")
+                self._debug_log(f"  VAD silence duration: {vad_silence_duration}s")
+                self._debug_log(f"  VAD max duration: {vad_max_duration}s")
+            else:
+                self._debug_log(f"  VAD mode: DISABLED")
+                self._debug_log(f"  Chunk duration: {chunk_duration}s")
+    
+    def _debug_log(self, message):
+        """Log debug message to stderr."""
+        if self.debug:
+            click.echo(f"[DEBUG] {message}", err=True)
+    
+    def _audio_callback(self, indata, frames, time, status):
+        """Callback function for sounddevice stream."""
+        if status:
+            self._debug_log(f"Audio callback status: {status}")
+        
+        # Convert to mono if needed and flatten
+        if self.channels == 1 and indata.shape[1] > 1:
+            audio_data = np.mean(indata, axis=1)
+        else:
+            audio_data = indata[:, 0]
+        
+        # Put audio data in queue
+        self.audio_queue.put(audio_data.copy())
+    
+    def start_streaming(self):
+        """Start continuous audio streaming using sounddevice."""
+        if self.stream is not None:
+            return
+        
+        try:
+            # Start audio stream
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype=np.float32,
+                callback=self._audio_callback,
+                blocksize=int(self.sample_rate * 0.1)  # 100ms blocks
+            )
+            self.stream.start()
+            
+            # Start processing thread
+            self.stop_event.clear()
+            self.recording_thread = threading.Thread(target=self._process_audio_stream)
+            self.recording_thread.start()
+            
+            self._debug_log("Started Windows audio streaming")
+            
+        except Exception as e:
+            raise RuntimeError(f"Error starting Windows audio recording: {e}")
+    
+    def stop_streaming(self):
+        """Stop continuous audio streaming."""
+        self.stop_event.set()
+        
+        if self.stream is not None:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+        
+        if self.recording_thread and self.recording_thread.is_alive():
+            self.recording_thread.join(timeout=2)
+        
+        self._debug_log("Stopped Windows audio streaming")
+    
+    def _process_audio_stream(self):
+        """Process incoming audio data in streaming mode."""
+        while not self.stop_event.is_set():
+            try:
+                # Get audio data with timeout
+                try:
+                    audio_chunk = self.audio_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                
+                # Add to buffer
+                self.buffer = np.append(self.buffer, audio_chunk)
+                
+                # Process based on mode
+                if self.vad_mode:
+                    self._process_vad_mode()
+                else:
+                    self._process_fixed_chunks()
+                    
+            except Exception as e:
+                self._debug_log(f"Error in audio processing: {e}")
+                self.debug_stats['processing_errors'] += 1
+    
+    def _process_fixed_chunks(self):
+        """Process audio in fixed-duration chunks."""
+        if len(self.buffer) >= self.chunk_samples:
+            # Extract chunk
+            chunk = self.buffer[:self.chunk_samples]
+            
+            # Keep overlap for next chunk
+            if self.overlap_samples > 0:
+                self.buffer = self.buffer[self.chunk_samples - self.overlap_samples:]
+            else:
+                self.buffer = self.buffer[self.chunk_samples:]
+            
+            # Check if chunk has sufficient audio
+            if self._has_audio(chunk):
+                # Convert to int16 for Whisper (scale from [-1, 1] to [-32768, 32767])
+                chunk_int16 = (chunk * 32767).astype(np.int16)
+                self._write_chunk_to_temp_file(chunk_int16)
+                self.debug_stats['chunks_with_audio'] += 1
+            else:
+                self.debug_stats['chunks_skipped_silence'] += 1
+            
+            self.debug_stats['total_chunks_processed'] += 1
+    
+    def _process_vad_mode(self):
+        """Process audio using Voice Activity Detection."""
+        while len(self.buffer) >= self.vad_frame_size:
+            frame = self.buffer[:self.vad_frame_size]
+            self.buffer = self.buffer[self.vad_frame_size:]
+            
+            has_speech = self._has_audio(frame)
+            
+            if has_speech:
+                if not self.vad_in_speech:
+                    self.vad_in_speech = True
+                    self._debug_log("Speech detected - starting recording")
+                
+                self.vad_speech_buffer = np.append(self.vad_speech_buffer, frame)
+                self.vad_current_chunk_samples += len(frame)
+                self.vad_consecutive_silence_frames = 0
+                
+                # Check max duration
+                if self.vad_current_chunk_samples >= self.vad_max_samples:
+                    self._flush_vad_buffer("max duration reached")
+                    self.debug_stats['vad_chunks_by_max_duration'] += 1
+            else:
+                if self.vad_in_speech:
+                    self.vad_speech_buffer = np.append(self.vad_speech_buffer, frame)
+                    self.vad_current_chunk_samples += len(frame)
+                    self.vad_consecutive_silence_frames += 1
+                    
+                    # Check if enough silence to end speech
+                    silence_samples = self.vad_consecutive_silence_frames * self.vad_frame_size
+                    if silence_samples >= self.vad_silence_samples:
+                        self._flush_vad_buffer("silence detected")
+                        self.debug_stats['vad_chunks_by_silence'] += 1
+    
+    def _flush_vad_buffer(self, reason):
+        """Flush the VAD speech buffer."""
+        if len(self.vad_speech_buffer) > 0:
+            self._debug_log(f"Flushing VAD buffer: {reason} ({len(self.vad_speech_buffer)} samples)")
+            
+            # Convert to int16 for Whisper
+            chunk_int16 = (self.vad_speech_buffer * 32767).astype(np.int16)
+            self._write_chunk_to_temp_file(chunk_int16)
+            
+            self.debug_stats['chunks_with_audio'] += 1
+            self.debug_stats['total_chunks_processed'] += 1
+        
+        # Reset VAD state
+        self.vad_speech_buffer = np.array([], dtype=np.float32)
+        self.vad_current_chunk_samples = 0
+        self.vad_consecutive_silence_frames = 0
+        self.vad_in_speech = False
+    
+    def _has_audio(self, chunk):
+        """Check if audio chunk contains significant audio."""
+        rms = np.sqrt(np.mean(chunk ** 2))
+        return rms > self.silence_threshold
+    
+    def _write_chunk_to_temp_file(self, chunk):
+        """Write audio chunk to temporary WAV file."""
+        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        temp_filename = temp_file.name
+        temp_file.close()
+        
+        # Write WAV file
+        with wave.open(temp_filename, 'wb') as wav_file:
+            wav_file.setnchannels(self.channels)
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(self.sample_rate)
+            wav_file.writeframes(chunk.tobytes())
+        
+        # Add to chunk queue for processing
+        self.chunk_queue.put(temp_filename)
+    
+    def get_next_chunk(self):
+        """Get the next audio chunk for transcription."""
+        try:
+            return self.chunk_queue.get(timeout=0.1)
+        except queue.Empty:
+            return None
+    
+    def get_next_vad_chunk(self):
+        """Get the next VAD chunk for transcription. Compatible with StreamingRecorder interface."""
+        return self.get_next_chunk()
+    
+    def cleanup(self):
+        """Clean up resources."""
+        self.stop_streaming()
 
 
 class StreamingRecorder:
@@ -623,15 +888,32 @@ def main(model, language, verbose, batch, chunk_duration, overlap_duration, sile
         if verbose or debug:
             click.echo(f"Starting VAD streaming mode (silence: {vad_silence_duration}s, max: {vad_max_duration}s)", err=True)
         
-        recorder = StreamingRecorder(
-            chunk_duration=chunk_duration,
-            overlap_duration=overlap_duration,
-            silence_threshold=silence_threshold,
-            debug=debug,
-            vad_mode=True,
-            vad_silence_duration=vad_silence_duration,
-            vad_max_duration=vad_max_duration
-        )
+        # Use Windows-specific audio recorder on Windows if available
+        current_platform = platform.system().lower()
+        if current_platform == "windows" and SOUNDDEVICE_AVAILABLE:
+            if debug:
+                click.echo("[DEBUG] Using Windows native audio recorder (sounddevice)", err=True)
+            recorder = WindowsAudioRecorder(
+                chunk_duration=chunk_duration,
+                overlap_duration=overlap_duration,
+                silence_threshold=silence_threshold,
+                debug=debug,
+                vad_mode=True,
+                vad_silence_duration=vad_silence_duration,
+                vad_max_duration=vad_max_duration
+            )
+        else:
+            if debug and current_platform == "windows":
+                click.echo("[DEBUG] sounddevice not available, falling back to FFmpeg", err=True)
+            recorder = StreamingRecorder(
+                chunk_duration=chunk_duration,
+                overlap_duration=overlap_duration,
+                silence_threshold=silence_threshold,
+                debug=debug,
+                vad_mode=True,
+                vad_silence_duration=vad_silence_duration,
+                vad_max_duration=vad_max_duration
+            )
         
         click.echo("Press Ctrl+C to stop streaming...", err=True)
         

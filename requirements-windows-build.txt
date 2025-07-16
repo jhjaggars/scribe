@@ -1,0 +1,23 @@
+# Windows build requirements for Scribe
+# Install with: pip install -r requirements-windows-build.txt
+
+# Core dependencies
+faster-whisper
+numpy>=2.0.0
+click
+torch==2.7.0
+torchaudio==2.7.0
+sounddevice
+
+# Build tools
+pyinstaller>=6.0.0
+setuptools
+wheel
+
+# Optional GPU support (comment out for CPU-only builds)
+# nvidia-cudnn-cu12
+
+# Development tools (optional)
+# pytest
+# black
+# flake8

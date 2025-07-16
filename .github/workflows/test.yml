@@ -60,10 +60,11 @@ jobs:
     - name: Install dependencies
       run: |
         uv sync
-        # Install GTK dependencies on Linux/macOS only
-        if [[ "${{ matrix.os }}" != "windows-latest" ]]; then
-          uv sync --extra gtk || echo "GTK dependencies failed to install"
-        fi
+      
+    - name: Install GTK dependencies (Linux/macOS only)
+      if: matrix.os != 'windows-latest'
+      run: |
+        uv sync --extra gtk || echo "GTK dependencies failed to install"
     
     - name: Install optional Windows dependencies
       if: matrix.os == 'windows-latest'

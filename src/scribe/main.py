@@ -585,7 +585,7 @@ class StreamingRecorder:
 @click.option('--language', default=None, 
               help='Language code (e.g., "en", "es", "fr"). Auto-detect if not specified.')
 @click.option('--verbose', is_flag=True, help='Enable verbose output')
-@click.option('--stream', is_flag=True, help='Enable continuous streaming mode')
+@click.option('--batch', is_flag=True, help='Enable batch recording mode (record once, then transcribe)')
 @click.option('--chunk-duration', default=5.0, type=float,
               help='Duration of each audio chunk in seconds (streaming mode)')
 @click.option('--overlap-duration', default=1.0, type=float,
@@ -593,21 +593,20 @@ class StreamingRecorder:
 @click.option('--silence-threshold', default=0.01, type=float,
               help='Silence threshold for detecting empty segments (streaming mode)')
 @click.option('--debug', is_flag=True, help='Enable detailed debug output for troubleshooting')
-@click.option('--no-newlines', is_flag=True, help='Output text without newlines (space-separated)')
-@click.option('--vad', is_flag=True, help='Enable Voice Activity Detection mode (break chunks on silence)')
+@click.option('--newlines', is_flag=True, help='Output text with newlines (default is space-separated)')
 @click.option('--vad-silence-duration', default=0.5, type=float,
               help='Duration of silence required to end a chunk in VAD mode (seconds)')
 @click.option('--vad-max-duration', default=30.0, type=float,
               help='Maximum chunk duration in VAD mode (seconds)')
-def main(model, language, verbose, stream, chunk_duration, overlap_duration, silence_threshold, debug, no_newlines, vad, vad_silence_duration, vad_max_duration):
+def main(model, language, verbose, batch, chunk_duration, overlap_duration, silence_threshold, debug, newlines, vad_silence_duration, vad_max_duration):
     """Record audio from microphone and transcribe it using OpenAI Whisper."""
     
     def output_text(text):
-        """Output text with proper formatting based on no_newlines flag."""
-        if no_newlines:
-            print(text.strip(), end=' ', flush=True)
-        else:
+        """Output text with proper formatting based on newlines flag."""
+        if newlines:
             print(text.strip(), flush=True)
+        else:
+            print(text.strip(), end=' ', flush=True)
     
     if verbose:
         click.echo(f"Loading Whisper model: {model}", err=True)
@@ -619,21 +618,17 @@ def main(model, language, verbose, stream, chunk_duration, overlap_duration, sil
         click.echo(f"Error loading Whisper model: {e}", err=True)
         sys.exit(1)
     
-    if stream:
-        # Streaming mode
-        if vad:
-            if verbose or debug:
-                click.echo(f"Starting VAD streaming mode (silence: {vad_silence_duration}s, max: {vad_max_duration}s)", err=True)
-        else:
-            if verbose or debug:
-                click.echo(f"Starting streaming mode (chunk: {chunk_duration}s, overlap: {overlap_duration}s)", err=True)
+    if not batch:
+        # Streaming mode (default)
+        if verbose or debug:
+            click.echo(f"Starting VAD streaming mode (silence: {vad_silence_duration}s, max: {vad_max_duration}s)", err=True)
         
         recorder = StreamingRecorder(
             chunk_duration=chunk_duration,
             overlap_duration=overlap_duration,
             silence_threshold=silence_threshold,
             debug=debug,
-            vad_mode=vad,
+            vad_mode=True,
             vad_silence_duration=vad_silence_duration,
             vad_max_duration=vad_max_duration
         )
@@ -651,15 +646,11 @@ def main(model, language, verbose, stream, chunk_duration, overlap_duration, sil
             
             # Process chunks continuously
             while True:
-                if vad:
-                    chunk_file = recorder.get_next_vad_chunk()
-                else:
-                    chunk_file = recorder.get_next_chunk()
+                chunk_file = recorder.get_next_vad_chunk()
                     
                 if chunk_file is None:
                     if debug:
-                        chunk_method = "get_next_vad_chunk" if vad else "get_next_chunk"
-                        click.echo(f"[DEBUG] {chunk_method} returned None, exiting loop", err=True)
+                        click.echo(f"[DEBUG] get_next_vad_chunk returned None, exiting loop", err=True)
                     break
                 
                 chunk_count += 1
@@ -707,7 +698,7 @@ def main(model, language, verbose, stream, chunk_duration, overlap_duration, sil
             recorder.cleanup()
     
     else:
-        # Original batch mode
+        # Batch mode
         recorder = FFmpegRecorder()
         
         click.echo("Press Ctrl+C to stop recording and transcribe...", err=True)
@@ -737,15 +728,15 @@ def main(model, language, verbose, stream, chunk_duration, overlap_duration, sil
             segments, info = whisper_model.transcribe(recorded_file, language=language)
             
             # Output transcription to stdout
-            if no_newlines:
-                # For no_newlines mode, output all segments as space-separated text
-                text = " ".join(segment.text for segment in segments)
-                output_text(text)
-            else:
-                # For normal mode, output each segment separately
+            if newlines:
+                # For newlines mode, output each segment separately
                 for segment in segments:
                     if segment.text.strip():
                         output_text(segment.text)
+            else:
+                # For default mode, output all segments as space-separated text
+                text = " ".join(segment.text for segment in segments)
+                output_text(text)
             
         except Exception as e:
             click.echo(f"Error during recording/transcription: {e}", err=True)

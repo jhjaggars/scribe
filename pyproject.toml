@@ -10,9 +10,12 @@ dependencies = [
     "click",
     "torch==2.7.0",
     "torchaudio==2.7.0",
-    "PyGObject",
     "sounddevice",
 ]
+
+[project.optional-dependencies]
+gtk = ["PyGObject"]
+all = ["PyGObject"]
 
 [project.scripts]
 scribe = "scribe.main:main"

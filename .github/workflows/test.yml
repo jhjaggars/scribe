@@ -34,7 +34,7 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       run: |
         sudo apt-get update
-        sudo apt-get install -y ffmpeg portaudio19-dev
+        sudo apt-get install -y ffmpeg portaudio19-dev libcairo2-dev libgirepository1.0-dev
     
     - name: Install system dependencies (macOS)
       if: matrix.os == 'macos-latest'
@@ -60,6 +60,10 @@ jobs:
     - name: Install dependencies
       run: |
         uv sync
+        # Install GTK dependencies on Linux/macOS only
+        if [[ "${{ matrix.os }}" != "windows-latest" ]]; then
+          uv sync --extra gtk || echo "GTK dependencies failed to install"
+        fi
     
     - name: Install optional Windows dependencies
       if: matrix.os == 'windows-latest'

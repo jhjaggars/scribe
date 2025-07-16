@@ -32,10 +32,7 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        variant: [cpu, gpu]
-        exclude:
-          # Skip GPU build on PRs to save time unless explicitly requested
-          - variant: gpu
+        variant: [cpu]
     
     steps:
     - name: Checkout code
@@ -238,7 +235,7 @@ jobs:
       shell: pwsh
     
     - name: Upload build artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: ${{ steps.package.outputs.package-name }}
         path: ${{ steps.package.outputs.zip-path }}

@@ -876,10 +876,17 @@ dependencies = [
     { name = "faster-whisper" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "pygobject" },
     { name = "sounddevice" },
     { name = "torch" },
     { name = "torchaudio" },
+]
+
+[package.optional-dependencies]
+all = [
+    { name = "pygobject" },
+]
+gtk = [
+    { name = "pygobject" },
 ]
 
 [package.metadata]
@@ -887,11 +894,13 @@ requires-dist = [
     { name = "click" },
     { name = "faster-whisper" },
     { name = "numpy", specifier = ">=2.0.0" },
-    { name = "pygobject" },
+    { name = "pygobject", marker = "extra == 'all'" },
+    { name = "pygobject", marker = "extra == 'gtk'" },
     { name = "sounddevice" },
     { name = "torch", specifier = "==2.7.0" },
     { name = "torchaudio", specifier = "==2.7.0" },
 ]
+provides-extras = ["gtk", "all"]
 
 [[package]]
 name = "setuptools"

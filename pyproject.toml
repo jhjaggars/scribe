@@ -15,7 +15,10 @@ dependencies = [
 
 [project.scripts]
 scribe = "scribe.main:main"
+scribe-daemon = "scribe.daemon:main"
+scribe-client = "scribe.client:main"
 scribe-gui = "scribe.gui:main"
+scribe-gui-daemon = "scribe.gui_daemon:main"
 
 [build-system]
 requires = ["hatchling"]

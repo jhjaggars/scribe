@@ -18,22 +18,36 @@ import click
 
 # Set up cuDNN library path for NVIDIA GPU support
 def setup_cudnn_path():
-    """Automatically detect and set cuDNN library path."""
+    """Automatically detect and set cuDNN library path.
+    
+    Security Note: This function no longer uses process re-execution to avoid
+    potential code injection vulnerabilities. Instead, it sets the environment
+    variable for the current process only.
+    """
     try:
         import nvidia.cudnn
         cudnn_lib_path = Path(nvidia.cudnn.__file__).parent / "lib"
-        if cudnn_lib_path.exists():
+        if cudnn_lib_path.exists() and cudnn_lib_path.is_dir():
             current_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-            if str(cudnn_lib_path) not in current_ld_path:
-                new_ld_path = f"{cudnn_lib_path}:{current_ld_path}" if current_ld_path else str(cudnn_lib_path)
-                # Re-exec with the new environment variable
+            cudnn_path_str = str(cudnn_lib_path.resolve())  # Resolve to absolute path
+            
+            # Validate the path contains no suspicious characters
+            if not cudnn_path_str.replace('/', '').replace('-', '').replace('_', '').replace('.', '').isalnum():
+                print(f"Warning: Suspicious CUDA path detected, skipping: {cudnn_path_str}", file=sys.stderr)
+                return
+                
+            if cudnn_path_str not in current_ld_path:
+                new_ld_path = f"{cudnn_path_str}:{current_ld_path}" if current_ld_path else cudnn_path_str
                 os.environ["LD_LIBRARY_PATH"] = new_ld_path
-                os.execvpe(sys.executable, [sys.executable] + sys.argv, os.environ)
+                print(f"Set LD_LIBRARY_PATH to include cuDNN: {cudnn_path_str}", file=sys.stderr)
     except ImportError:
         # nvidia.cudnn not available, skip
         pass
+    except Exception as e:
+        print(f"Warning: Error setting up cuDNN path: {e}", file=sys.stderr)
 
 # Set up cuDNN path before importing faster_whisper
+# Only run once to avoid repeated setup
 if "SCRIBE_CUDNN_SETUP" not in os.environ:
     os.environ["SCRIBE_CUDNN_SETUP"] = "1"
     setup_cudnn_path()
@@ -108,7 +122,8 @@ class StreamingRecorder:
             try:
                 subprocess.run(["arecord", "-l"], capture_output=True, check=True)
                 return ["-f", "alsa", "-i", "default"]
-            except:
+            except (subprocess.CalledProcessError, FileNotFoundError, PermissionError):
+                # arecord not available or failed, fall back to pulse
                 return ["-f", "pulse", "-i", "default"]
         elif self.platform == "darwin":  # macOS
             return ["-f", "avfoundation", "-i", ":0"]
@@ -348,7 +363,8 @@ class StreamingRecorder:
             try:
                 self.process.stdin.write(b'q\n')
                 self.process.stdin.flush()
-            except:
+            except (BrokenPipeError, OSError):
+                # Process may have already closed stdin
                 pass
             
             try:
@@ -600,8 +616,9 @@ class ScribeDaemon:
                 # Clean up chunk file
                 try:
                     os.unlink(chunk_file)
-                except:
-                    pass
+                except (FileNotFoundError, PermissionError, OSError) as e:
+                    # Log specific errors for temp file cleanup issues
+                    print(f"Warning: Could not clean up temp file {chunk_file}: {e}", file=sys.stderr)
                     
             except Exception as e:
                 print(f"Transcription error: {e}", file=sys.stderr)

@@ -38,7 +38,8 @@ class DaemonManager:
         try:
             response = self.client.send_command("get_status")
             return response.get("status") == "success"
-        except:
+        except (ConnectionError, TimeoutError, OSError):
+            # Connection issues indicate daemon not responding properly
             return False
         finally:
             self.client.disconnect()
@@ -61,16 +62,23 @@ class DaemonManager:
                 
             if background:
                 # Start daemon in background
+                # Security: Use start_new_session instead of preexec_fn to avoid potential vulnerabilities
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    preexec_fn=os.setsid  # Create new process group
+                    start_new_session=True  # Create new process group (safer than preexec_fn)
                 )
                 
-                # Save PID
-                with open(self.pid_file, 'w') as f:
-                    f.write(str(process.pid))
+                # Save PID with secure permissions (0600 - owner read/write only)
+                # Create the file with secure permissions before writing
+                fd = os.open(self.pid_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+                try:
+                    with os.fdopen(fd, 'w') as f:
+                        f.write(str(process.pid))
+                except (OSError, IOError) as e:
+                    os.close(fd)  # Close if fdopen fails
+                    raise OSError(f"Failed to write PID file: {e}")
                     
             else:
                 # Start daemon in foreground
@@ -213,8 +221,8 @@ class DaemonManager:
         try:
             if self.pid_file.exists():
                 self.pid_file.unlink()
-        except:
-            pass
+        except (PermissionError, OSError) as e:
+            print(f"Warning: Could not remove PID file {self.pid_file}: {e}", file=sys.stderr)
 
 
 def main():

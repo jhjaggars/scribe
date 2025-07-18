@@ -5,6 +5,7 @@ import socket
 import threading
 import time
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable
@@ -25,9 +26,22 @@ class ScribeIPCProtocol:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
     
     def cleanup_socket(self):
-        """Remove socket file if it exists."""
-        if self.socket_path.exists():
+        """Remove socket file if it exists.
+        
+        Security Note: Use exception handling to avoid TOCTOU (Time-of-Check-Time-of-Use)
+        race condition vulnerabilities.
+        """
+        try:
             self.socket_path.unlink()
+        except FileNotFoundError:
+            # Socket file doesn't exist, which is fine
+            pass
+        except PermissionError:
+            # Permission denied - log the error but continue
+            print(f"Warning: Permission denied removing socket {self.socket_path}", file=sys.stderr)
+        except OSError as e:
+            # Other OS errors
+            print(f"Warning: Error removing socket {self.socket_path}: {e}", file=sys.stderr)
 
 
 class ScribeIPCServer:
@@ -55,6 +69,13 @@ class ScribeIPCServer:
         
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.bind(str(self.protocol.socket_path))
+        
+        # Set secure permissions on socket file (0600 - owner read/write only)
+        try:
+            os.chmod(self.protocol.socket_path, 0o600)
+        except OSError as e:
+            print(f"Warning: Could not set secure permissions on socket: {e}", file=sys.stderr)
+        
         self.socket.listen(5)
         
         self.running = True
@@ -72,7 +93,8 @@ class ScribeIPCServer:
         for client in self.clients[:]:
             try:
                 client.close()
-            except:
+            except (OSError, socket.error):
+                # Socket already closed or error closing
                 pass
         self.clients.clear()
         
@@ -80,7 +102,8 @@ class ScribeIPCServer:
         if self.socket:
             try:
                 self.socket.close()
-            except:
+            except (OSError, socket.error):
+                # Socket already closed or error closing
                 pass
             
         # Clean up socket file
